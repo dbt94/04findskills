@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
 import { existsSync } from 'fs';
@@ -30,7 +29,23 @@ export function getLockSource(parsedUrl: string, normalizedSource: string | null
   // When normalizedSource is used, parseSource() later resolves it to HTTPS,
   // breaking restore for private repos that require SSH authentication.
   const isSSH = parsedUrl.startsWith('git@') || parsedUrl.startsWith('ssh://');
-  return isSSH ? parsedUrl : normalizedSource;
+  if (isSSH) {
+    return parsedUrl;
+  }
+  if (parsedUrl.startsWith('http://') || parsedUrl.startsWith('https://')) {
+    try {
+      if (new URL(parsedUrl).hostname !== 'github.com') {
+        return parsedUrl;
+      }
+    } catch {
+      return normalizedSource;
+    }
+  }
+  return normalizedSource;
+}
+
+export function getProjectLockSourceUrl(sourceType: string, sourceUrl: string): string | undefined {
+  return sourceType === 'git' || sourceType === 'gitlab' ? sourceUrl : undefined;
 }
 import { cloneRepo, cleanupTempDir, GitCloneError } from './git.ts';
 import { discoverSkills, getSkillDisplayName, filterSkills } from './skills.ts';
@@ -62,7 +77,6 @@ import { detectAgent, getAgentType } from './detect-agent.ts';
 import { wellKnownProvider, type WellKnownSkill } from './providers/index.ts';
 import {
   addSkillToLock,
-  fetchSkillFolderHash,
   getGitHubToken,
   isPromptDismissed,
   dismissPrompt,
@@ -183,13 +197,6 @@ function shortenPath(fullPath: string, cwd: string): string {
     return '.' + fullPath.slice(cwd.length);
   }
   return fullPath;
-}
-
-function computeSingleFileSkillHash(contents: string): string {
-  const hash = createHash('sha256');
-  hash.update('SKILL.md');
-  hash.update(contents);
-  return hash.digest('hex');
 }
 
 /**
@@ -530,6 +537,8 @@ export interface AddOptions {
   agent?: string[];
   yes?: boolean;
   skill?: string[];
+  /** Valid JSON to attach to the install telemetry event. */
+  metadata?: string;
   list?: boolean;
   all?: boolean;
   fullDepth?: boolean;
@@ -552,7 +561,7 @@ async function handleWellKnownSkills(
   options: AddOptions,
   spinner: ReturnType<typeof p.spinner>
 ): Promise<void> {
-  spinner.start('Discovering skills from well-known endpoint...');
+  spinner.start('Discovering skills from well-known endpoint…');
 
   // Fetch all skills from the well-known endpoint
   const skills = await wellKnownProvider.fetchAllSkills(url);
@@ -629,7 +638,7 @@ async function handleWellKnownSkills(
     const skillChoices = skills.map((s) => ({
       value: s,
       label: s.installName,
-      hint: s.description.length > 60 ? s.description.slice(0, 57) + '...' : s.description,
+      hint: s.description.length > 60 ? s.description.slice(0, 57) + '…' : s.description,
     }));
 
     const selected = await multiselect({
@@ -665,7 +674,7 @@ async function handleWellKnownSkills(
 
     targetAgents = options.agent as AgentType[];
   } else {
-    spinner.start('Loading agents...');
+    spinner.start('Loading agents…');
     const installedAgents = await detectInstalledAgents();
     const totalAgents = Object.keys(agents).length;
     spinner.stop(`${totalAgents} agents`);
@@ -840,7 +849,7 @@ async function handleWellKnownSkills(
   const sourceIdentifier = wellKnownProvider.getSourceIdentifier(url);
   const wellKnownPrivacyPromise = isSourcePrivate(sourceIdentifier).catch(() => null);
 
-  spinner.start('Installing skills...');
+  spinner.start('Installing skills…');
 
   const results: {
     skill: string;
@@ -889,6 +898,7 @@ async function handleWellKnownSkills(
       agents: targetAgents.join(','),
       ...(installGlobally && { global: '1' }),
       skillFiles: JSON.stringify(skillFiles),
+      metadata: options.metadata,
       sourceType: 'well-known',
     });
   }
@@ -958,9 +968,13 @@ async function handleWellKnownSkills(
       if (firstResult.mode === 'copy') {
         // Copy mode: show skill name and list all agent paths
         resultLines.push(`${pc.green('✓')} ${skillName} ${pc.dim('(copied)')}`);
+        const shortPathsSet = new Set<string>();
         for (const r of skillResults) {
           const shortPath = shortenPath(r.path, cwd);
-          resultLines.push(`  ${pc.dim('→')} ${shortPath}`);
+          if (!shortPathsSet.has(shortPath)) {
+            shortPathsSet.add(shortPath);
+            resultLines.push(`  ${pc.dim('→')} ${shortPath}`);
+          }
         }
       } else {
         // Symlink mode: show canonical path and universal/symlinked agents
@@ -1072,7 +1086,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
   try {
     const spinner = p.spinner();
 
-    spinner.start('Parsing source...');
+    spinner.start('Parsing source…');
     const parsed = parseSource(source);
     spinner.stop(
       `Source: ${parsed.type === 'local' ? parsed.localPath! : parsed.url}${parsed.ref ? ` @ ${pc.yellow(parsed.ref)}` : ''}${parsed.subpath ? ` (${parsed.subpath})` : ''}${parsed.skillFilter ? ` ${pc.dim('@')}${pc.cyan(parsed.skillFilter)}` : ''}`
@@ -1083,6 +1097,9 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     // telemetry gating — it should never block user-visible output.
     const ownerRepoRaw = getOwnerRepo(parsed);
     const repoPrivacyPromise: Promise<boolean | null> = (() => {
+      // The privacy endpoint below is GitHub.com-specific. In particular, do
+      // not send GitHub Enterprise repository names to the public API.
+      if (parsed.type !== 'github') return Promise.resolve(null);
       if (!ownerRepoRaw) return Promise.resolve(null);
       const ownerRepo = parseOwnerRepo(ownerRepoRaw);
       if (!ownerRepo) return Promise.resolve(null);
@@ -1113,7 +1130,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
 
     if (parsed.type === 'local') {
       // Use local path directly, no cloning needed
-      spinner.start('Validating local path...');
+      spinner.start('Validating local path…');
       if (!existsSync(parsed.localPath!)) {
         spinner.stop(pc.red('Path not found'));
         p.outro(pc.red(`Local path does not exist: ${parsed.localPath}`));
@@ -1121,7 +1138,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
       spinner.stop('Local path validated');
 
-      spinner.start('Discovering skills...');
+      spinner.start('Discovering skills…');
       skills = await discoverSkills(parsed.localPath!, parsed.subpath, {
         includeInternal,
         fullDepth: options.fullDepth,
@@ -1136,7 +1153,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       const isSelfHostedRepo =
         !!ownerRepo && Object.hasOwn(BLOB_ALLOWED_REPOS, ownerRepo.toLowerCase());
       if (ownerRepo && owner && (isSelfHostedRepo || BLOB_ALLOWED_OWNERS.includes(owner))) {
-        spinner.start('Fetching skills...');
+        spinner.start('Fetching skills…');
         blobResult = await tryBlobInstall(ownerRepo, {
           subpath: parsed.subpath,
           skillFilter: parsed.skillFilter,
@@ -1145,7 +1162,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
           includeInternal,
         });
         if (!blobResult) {
-          spinner.stop(pc.dim('Falling back to clone...'));
+          spinner.stop(pc.dim('Falling back to clone…'));
         }
       }
 
@@ -1154,11 +1171,11 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         spinner.stop(`Found ${pc.green(skills.length)} skill${skills.length > 1 ? 's' : ''}`);
       } else {
         // Blob failed — fall back to git clone
-        spinner.start('Cloning repository...');
+        spinner.start('Cloning repository…');
         tempDir = await cloneRepo(parsed.url, parsed.ref);
         spinner.stop('Repository cloned');
 
-        spinner.start('Discovering skills...');
+        spinner.start('Discovering skills…');
         skills = await discoverSkills(tempDir, parsed.subpath, {
           includeInternal,
           fullDepth: options.fullDepth,
@@ -1166,11 +1183,11 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
     } else {
       // GitLab, git URL, or --full-depth: always clone
-      spinner.start('Cloning repository...');
+      spinner.start('Cloning repository…');
       tempDir = await cloneRepo(parsed.url, parsed.ref);
       spinner.stop('Repository cloned');
 
-      spinner.start('Discovering skills...');
+      spinner.start('Discovering skills…');
       skills = await discoverSkills(tempDir, parsed.subpath, {
         includeInternal,
         fullDepth: options.fullDepth,
@@ -1284,47 +1301,33 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       // Check if any skills have plugin grouping
       const hasGroups = sortedSkills.some((s) => s.pluginName);
 
-      let selected: Skill[] | symbol;
+      const kebabToTitle = (s: string) =>
+        s
+          .split('-')
+          .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+          .join(' ');
 
-      if (hasGroups) {
-        // Build grouped options for groupMultiselect
-        const kebabToTitle = (s: string) =>
-          s
-            .split('-')
-            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-            .join(' ');
+      const skillChoices = sortedSkills.map((s) => ({
+        value: s,
+        label: getSkillDisplayName(s),
+        group: hasGroups ? (s.pluginName ? kebabToTitle(s.pluginName) : 'Other') : undefined,
+        detail: s.description,
+      }));
 
-        const grouped: Record<string, p.Option<Skill>[]> = {};
-        for (const s of sortedSkills) {
-          const groupName = s.pluginName ? kebabToTitle(s.pluginName) : 'Other';
-          if (!grouped[groupName]) grouped[groupName] = [];
-          grouped[groupName]!.push({
-            value: s,
-            label: getSkillDisplayName(s),
-            hint: s.description.length > 60 ? s.description.slice(0, 57) + '...' : s.description,
-          });
-        }
+      const selected = await searchMultiselect({
+        message: hasGroups
+          ? `Select skills to install ${pc.dim('(space to toggle)')}`
+          : 'Select skills to install',
+        items: skillChoices,
+        required: true,
+        maxVisible: 20,
+        searchable: !hasGroups,
+        showDetail: true,
+        showSelectedSummary: false,
+        selectGroups: hasGroups,
+      });
 
-        selected = await p.groupMultiselect({
-          message: `Select skills to install ${pc.dim('(space to toggle)')}`,
-          options: grouped,
-          required: true,
-        });
-      } else {
-        const skillChoices = sortedSkills.map((s) => ({
-          value: s,
-          label: getSkillDisplayName(s),
-          hint: s.description.length > 60 ? s.description.slice(0, 57) + '...' : s.description,
-        }));
-
-        selected = await multiselect({
-          message: 'Select skills to install',
-          options: skillChoices,
-          required: true,
-        });
-      }
-
-      if (p.isCancel(selected)) {
+      if (isCancelled(selected)) {
         p.cancel('Installation cancelled');
         await cleanup(tempDir);
         process.exit(0);
@@ -1362,7 +1365,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
 
       targetAgents = options.agent as AgentType[];
     } else {
-      spinner.start('Loading agents...');
+      spinner.start('Loading agents…');
       const installedAgents = await detectInstalledAgents();
       const totalAgents = Object.keys(agents).length;
       spinner.stop(`${totalAgents} agents`);
@@ -1688,7 +1691,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
     }
 
-    spinner.start('Installing skills...');
+    spinner.start('Installing skills…');
 
     const results: {
       skill: string;
@@ -1714,15 +1717,12 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
             agent,
             { global: installGlobally, mode: installMode, eveSubagent: subagent }
           );
-        } else if (tempDir && skill.path === tempDir && skill.rawContent) {
-          // Remote root-level SKILL.md: install the skill file, not the whole repository.
-          result = await installBlobSkillForAgent(
-            { installName: skill.name, files: [{ path: 'SKILL.md', contents: skill.rawContent }] },
-            agent,
-            { global: installGlobally, mode: installMode }
-          );
         } else {
-          // Disk-based install: copy from cloned/local directory
+          // Disk-based install: copy from cloned/local directory.
+          // Root-level skills (SKILL.md at repo root, so skill.path === tempDir)
+          // also take this path and are copied recursively (see installer.ts
+          // copyDirectory, which excludes .git), so their scripts/, references/,
+          // assets/, etc. are installed too. See issue #1603.
           result = await installSkillForAgent(skill, agent, {
             global: installGlobally,
             mode: installMode,
@@ -1771,6 +1771,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     const normalizedSource = getOwnerRepo(parsed);
 
     const lockSource = getLockSource(parsed.url, normalizedSource);
+    const projectLockSourceUrl = getProjectLockSourceUrl(parsed.type, parsed.url);
 
     // Only track if we have a valid remote source and it's not a private repo.
     // repoPrivacyPromise was started early (right after parsing) so it has
@@ -1789,6 +1790,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
             agents: targetAgents.join(','),
             ...(installGlobally && { global: '1' }),
             skillFiles: JSON.stringify(skillFiles),
+            metadata: options.metadata,
           });
         }
       } else {
@@ -1800,6 +1802,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
           agents: targetAgents.join(','),
           ...(installGlobally && { global: '1' }),
           skillFiles: JSON.stringify(skillFiles),
+          metadata: options.metadata,
         });
       }
     }
@@ -1869,14 +1872,13 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
             const computedHash =
               blobResult && 'snapshotHash' in skill
                 ? (skill as BlobSkill).snapshotHash
-                : tempDir && skill.path === tempDir && skill.rawContent
-                  ? computeSingleFileSkillHash(skill.rawContent)
-                  : await computeSkillFolderHash(skill.path);
+                : await computeSkillFolderHash(skill.path);
             const skillPathValue = skillFiles[skill.name];
             await addSkillToLocalLock(
               skill.name,
               {
                 source: lockSource || parsed.url,
+                ...(projectLockSourceUrl && { sourceUrl: projectLockSourceUrl }),
                 ref: parsed.ref,
                 sourceType: parsed.type,
                 ...(skillPathValue && { skillPath: skillPathValue }),
@@ -1930,9 +1932,13 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
           if (firstResult.mode === 'copy') {
             // Copy mode: show skill name and list all agent paths
             resultLines.push(`${pc.green('✓')} ${entry.skill} ${pc.dim('(copied)')}`);
+            const shortPathsSet = new Set<string>();
             for (const r of skillResults) {
               const shortPath = shortenPath(r.path, cwd);
-              resultLines.push(`  ${pc.dim('→')} ${shortPath}`);
+              if (!shortPathsSet.has(shortPath)) {
+                shortPathsSet.add(shortPath);
+                resultLines.push(`  ${pc.dim('→')} ${shortPath}`);
+              }
             }
           } else {
             // Symlink mode: show canonical path and universal/symlinked agents
@@ -2077,7 +2083,7 @@ async function promptForFindSkills(
       }
 
       console.log();
-      p.log.step('Installing find-skills skill...');
+      p.log.step('Installing find-skills skill…');
 
       try {
         // Call runAdd directly
@@ -2104,9 +2110,14 @@ async function promptForFindSkills(
 }
 
 // Parse command line options from args array
-export function parseAddOptions(args: string[]): { source: string[]; options: AddOptions } {
+export function parseAddOptions(args: string[]): {
+  source: string[];
+  options: AddOptions;
+  errors: string[];
+} {
   const options: AddOptions = {};
   const source: string[] = [];
+  const errors: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -2139,6 +2150,18 @@ export function parseAddOptions(args: string[]): { source: string[]; options: Ad
         nextArg = args[i];
       }
       i--; // Back up one since the loop will increment
+    } else if (arg === '--metadata') {
+      const metadata = args[++i];
+      if (metadata === undefined) {
+        errors.push('--metadata requires a JSON value');
+      } else {
+        try {
+          JSON.parse(metadata);
+          options.metadata = metadata;
+        } catch {
+          errors.push('--metadata must be valid JSON');
+        }
+      }
     } else if (arg === '--full-depth') {
       options.fullDepth = true;
     } else if (arg === '--copy') {
@@ -2158,5 +2181,5 @@ export function parseAddOptions(args: string[]): { source: string[]; options: Ad
     }
   }
 
-  return { source, options };
+  return { source, options, errors };
 }
