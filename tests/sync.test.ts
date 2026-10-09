@@ -11,6 +11,8 @@ import {
   writeFileSync,
 } from 'fs';
 import { join, resolve } from 'path';
+import { execFileSync } from 'child_process';
+import { pathToFileURL } from 'url';
 import { tmpdir } from 'os';
 import { runCli } from '../src/test-utils.ts';
 
@@ -104,6 +106,24 @@ describe('experimental_sync command', () => {
 
       const result = runCli(['experimental_sync', '-y', '-a', 'claude-code'], testDir);
       expect(result.stdout).toContain('dev-skill');
+    });
+
+    it('reads optionalDependencies and peerDependencies', () => {
+      writeFileSync(
+        join(testDir, 'package.json'),
+        JSON.stringify({
+          optionalDependencies: { 'opt-tool': '*', 'not-installed': '*' },
+          peerDependencies: { 'peer-tool': '*' },
+        })
+      );
+      writeSkill(createPackage('opt-tool'), 'opt-skill');
+      writeSkill(createPackage('peer-tool'), 'peer-skill');
+
+      const result = runCli(['experimental_sync', '-y', '-a', 'claude-code'], testDir);
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(join(testDir, '.agents', 'skills', 'opt-skill'))).toBe(true);
+      expect(existsSync(join(testDir, '.agents', 'skills', 'peer-skill'))).toBe(true);
     });
 
     it('ignores packages that are not direct dependencies', () => {
@@ -611,6 +631,17 @@ describe('experimental_sync command', () => {
       expect(readLock().skills['leaf-skill'].via).toBe('pack-b');
     });
 
+    it('installs a skill once when two packs name the same package', () => {
+      declareProject(['pack-a', 'pack-b'], undefined);
+      createPack(join(testDir, 'node_modules', 'pack-a'), 'pack-a', ['npm:shared-lib']);
+      createPack(join(testDir, 'node_modules', 'pack-b'), 'pack-b', ['npm:shared-lib']);
+      writeSkill(join(createPackage('shared-lib'), 'skills', 'shared'), 'shared');
+
+      sync();
+
+      expect(installed('shared')).toBe(true);
+    });
+
     it('prefers a direct dependency over a transitive package with the same skill', () => {
       declareProject(['direct-lib', 'my-pack'], undefined);
       writeSkill(join(createPackage('direct-lib'), 'skills', 'migrate'), 'migrate');
@@ -665,15 +696,6 @@ describe('experimental_sync command', () => {
       expect(result.stdout).not.toContain('odd-lib:');
     });
 
-    it('reports remote entries as not synced yet', () => {
-      declareProject([], ['owner/repo@skill']);
-
-      const result = sync();
-
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('Skipped 1 remote "skills" entry');
-    });
-
     it('removes field skills when the pack is removed', () => {
       declareProject(['my-pack'], undefined);
       createPack(join(testDir, 'node_modules', 'my-pack'), 'my-pack', ['npm:far-lib']);
@@ -685,6 +707,307 @@ describe('experimental_sync command', () => {
       sync();
 
       expect(installed('far')).toBe(false);
+    });
+  });
+
+  describe('remote skills field entries', () => {
+    const sync = (...flags: string[]) =>
+      runCli(['experimental_sync', '-y', '-a', 'claude-code', ...flags], testDir);
+    const canonical = (name: string) => join(testDir, '.agents', 'skills', name);
+    const readLock = () => JSON.parse(readFileSync(join(testDir, 'skills-lock.json'), 'utf-8'));
+
+    /** A local git repository with one skills/<name> folder per name; returns its file:// URL. */
+    function createSkillsRepo(dirName: string, names: string[]): string {
+      const repo = join(testDir, '..', `${testDir.split(/[\\/]/).pop()}-${dirName}`);
+      for (const name of names) writeSkill(join(repo, 'skills', name), name);
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+      git('init', '-q');
+      git('add', '.');
+      git('commit', '-q', '-m', 'skills');
+      return pathToFileURL(repo).href;
+    }
+
+    function declareProject(deps: string[], skills: unknown): void {
+      writeFileSync(
+        join(testDir, 'package.json'),
+        JSON.stringify({
+          name: 'test-project',
+          dependencies: Object.fromEntries(deps.map((d) => [d, '*'])),
+          skills,
+        })
+      );
+    }
+
+    afterEach(() => {
+      for (const suffix of ['repo', 'other']) {
+        rmSync(join(testDir, '..', `${testDir.split(/[\\/]/).pop()}-${suffix}`), {
+          recursive: true,
+          force: true,
+        });
+      }
+    });
+
+    it('installs skills from a git source and records via', () => {
+      const repo = createSkillsRepo('repo', ['remote-a']);
+      declareProject([], [repo]);
+
+      const result = sync();
+
+      expect(result.exitCode).toBe(0);
+      expect(lstatSync(canonical('remote-a')).isDirectory()).toBe(true);
+      expect(readLock().skills['remote-a']).toMatchObject({
+        source: repo,
+        sourceType: 'git',
+        via: '.',
+      });
+    });
+
+    it('records the pack that requested the skill', () => {
+      const repo = createSkillsRepo('repo', ['remote-a']);
+      declareProject(['my-pack'], undefined);
+      const pack = join(testDir, 'node_modules', 'my-pack');
+      mkdirSync(pack, { recursive: true });
+      writeFileSync(
+        join(pack, 'package.json'),
+        JSON.stringify({ name: 'my-pack', skills: [repo] })
+      );
+
+      sync();
+
+      expect(readLock().skills['remote-a'].via).toBe('my-pack');
+    });
+
+    it('keeps only the skills an object entry names', () => {
+      const repo = createSkillsRepo('repo', ['remote-a', 'remote-b']);
+      declareProject([], [{ source: repo, skills: ['remote-a'] }]);
+
+      sync();
+
+      expect(existsSync(canonical('remote-a'))).toBe(true);
+      expect(existsSync(canonical('remote-b'))).toBe(false);
+    });
+
+    it('does not fetch again once installed', () => {
+      const repo = createSkillsRepo('repo', ['remote-a']);
+      declareProject([], [repo]);
+      sync();
+      rmSync(join(testDir, '..', `${testDir.split(/[\\/]/).pop()}-repo`), {
+        recursive: true,
+        force: true,
+      });
+
+      const result = sync();
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('Nothing to sync');
+      expect(existsSync(canonical('remote-a'))).toBe(true);
+    });
+
+    it('installs again when the skill folder is gone', () => {
+      const repo = createSkillsRepo('repo', ['remote-a']);
+      declareProject([], [repo]);
+      sync();
+      rmSync(canonical('remote-a'), { recursive: true, force: true });
+
+      sync();
+
+      expect(existsSync(join(canonical('remote-a'), 'SKILL.md'))).toBe(true);
+    });
+
+    it('removes skills that no field requests anymore', () => {
+      const repo = createSkillsRepo('repo', ['remote-a']);
+      declareProject([], [repo]);
+      sync();
+
+      declareProject([], []);
+      sync();
+
+      expect(existsSync(canonical('remote-a'))).toBe(false);
+      expect(readLock().skills['remote-a']).toBeUndefined();
+    });
+
+    it('--no-remote neither installs nor removes remote skills', () => {
+      const repo = createSkillsRepo('repo', ['remote-a', 'remote-b']);
+      declareProject([], [{ source: repo, skills: ['remote-a'] }]);
+      sync();
+
+      declareProject([], [{ source: repo, skills: ['remote-b'] }]);
+      sync('--no-remote');
+
+      expect(existsSync(canonical('remote-a'))).toBe(true);
+      expect(existsSync(canonical('remote-b'))).toBe(false);
+    });
+
+    it('prefers a skill shipped by a dependency', () => {
+      const repo = createSkillsRepo('repo', ['shared']);
+      declareProject(['my-lib'], [repo]);
+      writeSkill(join(createPackage('my-lib'), 'skills', 'shared'), 'shared');
+
+      const result = sync();
+
+      expect(result.stdout).toContain('another source in this sync provides it');
+      expect(lstatSync(canonical('shared')).isSymbolicLink()).toBe(true);
+      expect(readLock().skills.shared.sourceType).toBe('node_modules');
+    });
+
+    it('never shadows a skill installed with skills add', () => {
+      const repo = createSkillsRepo('repo', ['remote-a']);
+      declareProject([], [repo]);
+      writeSkill(canonical('remote-a'), 'remote-a');
+      writeFileSync(join(canonical('remote-a'), 'mine.md'), 'keep');
+      writeFileSync(
+        join(testDir, 'skills-lock.json'),
+        JSON.stringify({
+          version: 1,
+          skills: { 'remote-a': { source: 'owner/repo', sourceType: 'github', computedHash: 'x' } },
+        })
+      );
+
+      const result = sync();
+
+      expect(result.stdout).toContain('installed with `skills add`');
+      expect(existsSync(join(canonical('remote-a'), 'mine.md'))).toBe(true);
+    });
+
+    it('reports a failing source and still installs the rest', () => {
+      const missing = pathToFileURL(join(testDir, 'no-such-repo')).href;
+      declareProject(['my-lib'], [missing]);
+      writeSkill(join(createPackage('my-lib'), 'skills', 'shipped'), 'shipped');
+
+      const result = sync();
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain('Failed to install from');
+      expect(lstatSync(canonical('shipped')).isSymbolicLink()).toBe(true);
+    });
+
+    it('stops on a project entry that is not a git source', () => {
+      declareProject([], ['./local-skills']);
+
+      const result = sync();
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain('is not a git source');
+    });
+  });
+
+  describe('--recursive', () => {
+    const sync = (...flags: string[]) =>
+      runCli(['experimental_sync', '-y', '-a', 'claude-code', ...flags], testDir);
+    const installed = (name: string) => existsSync(join(testDir, '.agents', 'skills', name));
+    const readLock = () => JSON.parse(readFileSync(join(testDir, 'skills-lock.json'), 'utf-8'));
+
+    function writeJson(path: string, data: Record<string, unknown>): void {
+      mkdirSync(join(path, '..'), { recursive: true });
+      writeFileSync(path, JSON.stringify(data));
+    }
+
+    /** A package at `dir` that ships one skill. */
+    function createSkillPackage(dir: string, name: string, skill: string): void {
+      writeJson(join(dir, 'package.json'), { name, version: '1.0.0' });
+      writeSkill(join(dir, 'skills', skill), skill);
+    }
+
+    it('reads the dependencies of npm workspace packages (hoisted)', () => {
+      writeJson(join(testDir, 'package.json'), { name: 'root', workspaces: ['packages/*'] });
+      writeJson(join(testDir, 'packages', 'app', 'package.json'), {
+        name: '@acme/app',
+        dependencies: { 'lib-a': '*' },
+      });
+      createSkillPackage(join(testDir, 'node_modules', 'lib-a'), 'lib-a', 'skill-a');
+
+      sync();
+      expect(installed('skill-a')).toBe(false);
+
+      sync('--recursive');
+      expect(installed('skill-a')).toBe(true);
+    });
+
+    it('reads pnpm workspace packages and their own node_modules', () => {
+      writeJson(join(testDir, 'package.json'), { name: 'root' });
+      writeFileSync(
+        join(testDir, 'pnpm-workspace.yaml'),
+        "packages:\n  - 'apps/*'\n  - '!apps/legacy'\n"
+      );
+      writeJson(join(testDir, 'apps', 'web', 'package.json'), {
+        name: 'web',
+        dependencies: { 'lib-b': '*' },
+      });
+      createSkillPackage(join(testDir, 'apps', 'web', 'node_modules', 'lib-b'), 'lib-b', 'skill-b');
+      writeJson(join(testDir, 'apps', 'legacy', 'package.json'), {
+        name: 'legacy',
+        dependencies: { 'lib-c': '*' },
+      });
+      createSkillPackage(
+        join(testDir, 'apps', 'legacy', 'node_modules', 'lib-c'),
+        'lib-c',
+        'skill-c'
+      );
+
+      sync('-r');
+
+      expect(installed('skill-b')).toBe(true);
+      expect(installed('skill-c')).toBe(false);
+    });
+
+    it('prefers a root dependency over a workspace dependency with the same skill', () => {
+      writeJson(join(testDir, 'package.json'), {
+        name: 'root',
+        workspaces: ['packages/*'],
+        dependencies: { 'root-lib': '*' },
+      });
+      createSkillPackage(join(testDir, 'node_modules', 'root-lib'), 'root-lib', 'shared');
+      writeJson(join(testDir, 'packages', 'app', 'package.json'), {
+        name: 'app',
+        dependencies: { 'app-lib': '*' },
+      });
+      createSkillPackage(
+        join(testDir, 'packages', 'app', 'node_modules', 'app-lib'),
+        'app-lib',
+        'shared'
+      );
+
+      const result = sync('-r');
+
+      expect(result.stdout).toContain('closer to the project');
+      expect(readLock().skills.shared.source).toBe('root-lib');
+    });
+
+    it('installs neither when two workspaces ship different copies of a skill', () => {
+      writeJson(join(testDir, 'package.json'), { name: 'root', workspaces: ['packages/*'] });
+      for (const app of ['one', 'two']) {
+        writeJson(join(testDir, 'packages', app, 'package.json'), {
+          name: app,
+          dependencies: { 'shared-lib': '*' },
+        });
+        createSkillPackage(
+          join(testDir, 'packages', app, 'node_modules', 'shared-lib'),
+          'shared-lib',
+          'shared'
+        );
+      }
+
+      const result = sync('-r');
+
+      expect(result.stdout).toContain('--exclude shared-lib#shared');
+      expect(installed('shared')).toBe(false);
+    });
+
+    it('reads the skills field of a workspace package', () => {
+      writeJson(join(testDir, 'package.json'), { name: 'root', workspaces: ['packages/*'] });
+      writeJson(join(testDir, 'packages', 'app', 'package.json'), {
+        name: 'app',
+        skills: ['npm:far-lib'],
+      });
+      createSkillPackage(join(testDir, 'node_modules', 'far-lib'), 'far-lib', 'far');
+
+      sync('-r');
+
+      expect(readLock().skills.far).toMatchObject({ source: 'far-lib', via: 'app' });
     });
   });
 
