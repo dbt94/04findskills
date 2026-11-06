@@ -169,11 +169,12 @@ ${BOLD}Update Options:${RESET}
   -y, --yes              Skip scope prompt (auto-detect: project if in a project, else global)
 
 ${BOLD}Project:${RESET}
-  experimental_install Restore skills from skills-lock.json
+  experimental_install Restore skills from skills-lock.json (alias: install, i)
   init [name]          Initialize a skill (creates <name>/SKILL.md or ./SKILL.md)
   experimental_sync    Sync skills from node_modules into agent directories (alias: sync)
 
 ${BOLD}Experimental Install Options:${RESET}
+  -a, --agent <agents>   Link to these agents (default: last selected, else detected)
   --dry-run              Show what would be restored without installing anything
   --frozen-lockfile      Fail instead of changing skills-lock.json (default in CI)
   --no-frozen-lockfile   Allow skills-lock.json to change in CI
@@ -388,6 +389,12 @@ async function main(): Promise<void> {
     case 'a':
     case 'add': {
       const { source: addSource, options: addOpts, errors } = parseAddOptions(restArgs);
+      // `skills install` with no source restores skills-lock.json, like `npm install`
+      if ((command === 'i' || command === 'install') && addSource.length === 0) {
+        if (!inAgent) showLogo();
+        await runInstallFromLock(restArgs);
+        break;
+      }
       // JSON mode must keep stdout parseable — no logo
       if (!inAgent && !addOpts.json) showLogo();
       if (errors.length > 0) {
