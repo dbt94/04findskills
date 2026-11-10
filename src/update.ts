@@ -1,7 +1,6 @@
-import { existsSync, readdirSync } from 'fs';
+import { existsSync, readdirSync, realpathSync } from 'fs';
 import { join, dirname, relative, sep } from 'path';
 import * as p from '@clack/prompts';
-import pc from 'picocolors';
 
 import {
   readSkillLock,
@@ -23,7 +22,7 @@ import {
   shouldUseFullDepthForUpdate,
 } from './update-source.ts';
 import { cloneRepo, cleanupTempDir, getGitTreeHash } from './git.ts';
-import { discoverSkills } from './skills.ts';
+import { discoverSkills, isSubpathSafe, parseSkillMd } from './skills.ts';
 import { fetchRepoTree, getSkillFolderHashFromTree, type RepoTree } from './blob.ts';
 import { mapConcurrent } from './concurrency.ts';
 import { parseSource } from './source-parser.ts';
@@ -49,17 +48,15 @@ import {
   type SkillLocationResolutionOptions,
 } from './skill-relocation.ts';
 import { listInstalledSkills } from './installer.ts';
+import { parseCliArgs, throwFirstError } from './cli-args.ts';
 import { wellKnownProvider, computeWellKnownSkillDigest } from './providers/index.ts';
+import { isDiagnostic } from './diagnostics.ts';
 import { removeCommand } from './remove.ts';
 import { sanitizeMetadata } from './sanitize.ts';
 import { track } from './telemetry.ts';
 import { agents, isUniversalAgent } from './agents.ts';
-import type { AgentType } from './types.ts';
-
-const RESET = '\x1b[0m';
-const BOLD = '\x1b[1m';
-const DIM = '\x1b[38;5;102m';
-const TEXT = '\x1b[38;5;145m';
+import type { AgentType, Skill } from './types.ts';
+import { BOLD, CLEAR_LINE, DIM, RESET, TEXT, pc } from './color.ts';
 
 function printFetching(sourceCount: number): void {
   if (sourceCount === 0) return;
@@ -158,22 +155,17 @@ function parseUpdateSource(installUrl: string, sourceType: string) {
 }
 
 export function parseUpdateOptions(args: string[]): UpdateCheckOptions {
+  const { values, positionals, errors } = parseCliArgs(args, {
+    global: { type: 'boolean', short: 'g' },
+    project: { type: 'boolean', short: 'p' },
+    yes: { type: 'boolean', short: 'y' },
+  });
+  throwFirstError(errors);
   const options: UpdateCheckOptions = {};
-  const positional: string[] = [];
-  for (const arg of args) {
-    if (arg === '-g' || arg === '--global') {
-      options.global = true;
-    } else if (arg === '-p' || arg === '--project') {
-      options.project = true;
-    } else if (arg === '-y' || arg === '--yes') {
-      options.yes = true;
-    } else if (!arg.startsWith('-')) {
-      positional.push(arg);
-    }
-  }
-  if (positional.length > 0) {
-    options.skills = positional;
-  }
+  if (values.global) options.global = true;
+  if (values.project) options.project = true;
+  if (values.yes) options.yes = true;
+  if (positionals.length > 0) options.skills = positionals;
   return options;
 }
 
@@ -469,11 +461,20 @@ export async function checkWellKnownForUpdates(
 
   if (needsContentCheck.length > 0) {
     const tracked = new Set(needsContentCheck.map((item) => item.name));
+    // An incomplete download says nothing about upstream changes, so skip the skill.
+    const incomplete = new Set<string>();
     const skills = (
       await Promise.all(
         indexResult.entries
           .filter((entry) => tracked.has(entry.name))
-          .map((entry) => wellKnownProvider.fetchSkillByEntry(entry).catch(() => null))
+          .map((entry) =>
+            wellKnownProvider.fetchSkillByEntry(entry).catch((error) => {
+              if (isDiagnostic(error, 'SKILLS_WELLKNOWN_FILE_FETCH_FAILED')) {
+                incomplete.add(entry.name);
+              }
+              return null;
+            })
+          )
       )
     ).filter((skill): skill is NonNullable<typeof skill> => skill !== null);
     if (skills.length === 0) return { status: 'error' };
@@ -481,6 +482,7 @@ export async function checkWellKnownForUpdates(
       skills.map((skill) => [skill.installName, computeWellKnownSkillDigest(skill)])
     );
     for (const item of needsContentCheck) {
+      if (incomplete.has(item.name)) continue;
       const digest = digests.get(item.name);
       if (!digest || !item.digest || digest !== item.digest) {
         changedSkills.push(item.name);
@@ -523,7 +525,7 @@ export async function processWellKnownUpdates(
   const pending: Array<{ baseUrl: string; items: WellKnownUpdateItem[]; changedSkills: string[] }> =
     [];
   for (const [index, [baseUrl, items]] of entries.entries()) {
-    process.stdout.write(`\r${DIM}Checking skills from source: ${baseUrl}${RESET}\x1b[K\n`);
+    process.stdout.write(`${CLEAR_LINE}${DIM}Checking skills from source: ${baseUrl}${RESET}\n`);
 
     const result = results[index]!;
 
@@ -633,7 +635,7 @@ async function processDownloadUpdates(
 
   for (const [index, [url, group]] of groups.entries()) {
     const source = fetched[index]!;
-    process.stdout.write(`\r${DIM}Checking skills from source: ${url}${RESET}\x1b[K\n`);
+    process.stdout.write(`${CLEAR_LINE}${DIM}Checking skills from source: ${url}${RESET}\n`);
     if (!source.resolved) {
       failCount += group.length;
       console.log(`  ${DIM}✗ Failed to check skills from ${url}: ${source.error}${RESET}`);
@@ -834,7 +836,7 @@ export async function updateGlobalSkills(
     const isGitHubSource = firstEntry.sourceType === 'github';
     const checkout = checkouts[index]!;
 
-    process.stdout.write(`\r${DIM}Checking skills from source: ${source}${RESET}\x1b[K\n`);
+    process.stdout.write(`${CLEAR_LINE}${DIM}Checking skills from source: ${source}${RESET}\n`);
 
     if ('error' in checkout) {
       console.log(`  ${DIM}✗ Failed to check skills from ${source}${RESET}`);
@@ -909,7 +911,7 @@ export async function updateGlobalSkills(
   }
 
   if (checkable.length > 0) {
-    process.stdout.write('\r\x1b[K');
+    process.stdout.write(CLEAR_LINE);
   }
 
   const checkedCount = checkable.length + skipped.length + otherCount;
@@ -986,6 +988,39 @@ export async function updateGlobalSkills(
 
   printSkippedSkills(skipped);
   return { successCount, failCount, checkedCount };
+}
+
+function isRealpathWithin(realRoot: string, path: string): boolean {
+  try {
+    const real = realpathSync(path);
+    return real === realRoot || real.startsWith(realRoot + sep);
+  } catch {
+    return false;
+  }
+}
+
+async function readLockedSkills(
+  tempDir: string,
+  lockSkills: Record<string, { skillPath?: string }>,
+  names: string[]
+): Promise<Skill[] | null> {
+  const skills: Skill[] = [];
+  const realRoot = realpathSync(tempDir);
+  for (const name of names) {
+    const skillPath = lockSkills[name]?.skillPath;
+    if (!skillPath || !isSubpathSafe(tempDir, skillPath)) return null;
+    const skillMdPath = join(tempDir, skillPath);
+    if (!existsSync(skillMdPath)) return null;
+    // The lexical check above does not see symlinks; a linked skill directory
+    // or SKILL.md could point at host files outside the clone.
+    if (!isRealpathWithin(realRoot, dirname(skillMdPath))) return null;
+    if (!isRealpathWithin(realRoot, skillMdPath)) return null;
+    // An unparseable locked skill may have moved; let full discovery decide.
+    const skill = await parseSkillMd(skillMdPath);
+    if (!skill) return null;
+    skills.push(skill);
+  }
+  return skills;
 }
 
 export async function updateProjectSkills(
@@ -1149,11 +1184,18 @@ export async function updateProjectSkills(
 
     let checked = false;
     try {
-      const discovered = await discoverSkills(tempDir, undefined, {
+      // Every lock entry for the source must be path-addressable: deletion checks
+      // resolve all of them, including skills filtered out of this run.
+      // Generic Git sources reinstall by name, so they keep full discovery to
+      // detect same-name mirrors.
+      const reinstallsByName = shouldUseFullDepthForUpdate(firstEntry);
+      let discovered = reinstallsByName
+        ? null
+        : await readLockedSkills(tempDir, localLock.skills, allLockedForSource);
+      discovered ??= await discoverSkills(tempDir, undefined, {
         fullDepth: true,
         includeDuplicateNames: true,
       });
-
       const discoveredLocations = discovered.map((skill) => ({
         name: skill.name,
         skillPath: join(relative(tempDir, skill.path), 'SKILL.md').split(sep).join('/'),
@@ -1166,7 +1208,7 @@ export async function updateProjectSkills(
         false,
         options,
         discoveredLocations,
-        { exactPathDisambiguates: !shouldUseFullDepthForUpdate(firstEntry) }
+        { exactPathDisambiguates: !reinstallsByName }
       );
       checked = true;
       const deleted = new Set(resolution.deletedSkills);
